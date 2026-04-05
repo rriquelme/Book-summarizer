@@ -63,3 +63,5 @@ Thumbs.db
 
 # Test files
 test*
+*.txt
+intermediate*
