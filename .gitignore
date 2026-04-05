@@ -65,3 +65,6 @@ Thumbs.db
 test*
 *.txt
 intermediate*
+ollama_dev/.claude/settings.local.json
+*pdf
+*md
