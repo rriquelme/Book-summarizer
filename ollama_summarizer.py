@@ -21,17 +21,34 @@ Prerequisites:
   # Pull a model: ollama pull qwen2.5:32b
 
 Usage:
-  # Fully local (zero cost)
-  python ollama_summarizer.py book.pdf --title "Deep Work" --author "Cal Newport"
+  # See what models you have installed
+  python ollama_summarizer.py --list-installed
+
+  # Fully local (zero cost) - using your installed model
+  python ollama_summarizer.py book.pdf --title "Deep Work" --author "Cal Newport" \
+    --model glm-4.7-flash:latest
+
+  # Save raw chunks (original book text BEFORE LLM processing)
+  python ollama_summarizer.py book.pdf --title "Deep Work" --author "Cal Newport" \
+    --model glm-4.7-flash:latest --save-raw-chunks
+
+  # Save LLM output chunks (analysis AFTER LLM processing)
+  python ollama_summarizer.py book.pdf --title "Deep Work" --author "Cal Newport" \
+    --model glm-4.7-flash:latest --save-chunks
+
+  # Save BOTH raw input and LLM output chunks
+  python ollama_summarizer.py book.pdf --title "Deep Work" --author "Cal Newport" \
+    --model glm-4.7-flash:latest --save-raw-chunks --save-chunks
 
   # Local extraction + Claude synthesis (best quality, ~$0.05 per book)
-  python ollama_summarizer.py book.pdf --title "Deep Work" --claude-synthesis
+  python ollama_summarizer.py book.pdf --title "Deep Work" --claude-synthesis \
+    --model glm-4.7-flash:latest
 
-  # Use a specific Ollama model
-  python ollama_summarizer.py book.pdf --model "llama3:70b"
+  # Use a different model
+  python ollama_summarizer.py book.pdf --model "qwen2.5-coder:14b"
 
-  # Faster with smaller model (less quality)
-  python ollama_summarizer.py book.pdf --model "qwen2.5:14b"
+  # Show recommended models
+  python ollama_summarizer.py --list-models
 """
 
 import os
@@ -95,6 +112,8 @@ class OllamaConfig:
 
     # Output
     include_notebooklm_source: bool = True
+    save_individual_chunks: bool = False   # Save LLM analysis to individual files?
+    save_raw_chunks: bool = False          # Save raw input chunks (before LLM)?
 
     # Performance
     num_parallel: int = 1           # Ollama handles one request at a time by default
@@ -128,26 +147,28 @@ class OllamaClient:
         """Verify the model is available locally."""
         client = self._get_client()
         try:
-            models = client.list()
-            model_names = []
-            for m in models.get("models", []):
-                name = m.get("name", "") if isinstance(m, dict) else getattr(m, "name", "")
-                model_names.append(name)
+            models_response = client.list()
+            model_names = self._extract_model_names(models_response)
+
+            if not model_names:
+                print(f"\n  ERROR: No models found. Make sure Ollama is running and you have pulled a model.")
+                print(f"  Run: ollama pull qwen2.5:32b")
+                return False
 
             # Check if our model is available (handle tag variations)
             target = self.config.ollama_model
-            found = any(
-                target in name or name.startswith(target.split(":")[0])
-                for name in model_names
-            )
+            found = self._find_matching_model(target, model_names)
 
             if not found:
                 print(f"\n  WARNING: Model '{target}' not found locally.")
-                print(f"  Available models: {', '.join(model_names[:10])}")
-                print(f"  Pull it with: ollama pull {target}")
+                print(f"\n  Available models:")
+                for name in sorted(model_names):
+                    print(f"    - {name}")
+                print(f"\n  Use one of the available models, e.g.:")
+                print(f"    python ollama_summarizer.py book.pdf --model {model_names[0]}")
                 return False
 
-            print(f"  Model '{target}' is available.")
+            print(f"  [OK] Model '{target}' is available.")
             return True
 
         except Exception as e:
@@ -155,6 +176,62 @@ class OllamaClient:
             print(f"  Make sure Ollama is running: ollama serve")
             print(f"  Error: {e}")
             return False
+
+    def _extract_model_names(self, models_response) -> list[str]:
+        """Extract model names from ollama client response."""
+        model_names = []
+
+        # Handle both dict and object responses
+        if isinstance(models_response, dict):
+            models_list = models_response.get("models", [])
+        else:
+            models_list = getattr(models_response, "models", [])
+
+        for m in models_list:
+            try:
+                # Try dict access first (some API versions return dict)
+                if isinstance(m, dict):
+                    name = m.get("model") or m.get("name")
+                else:
+                    # Try object attribute access (ollama._types.ListResponse.Model)
+                    # The ollama library uses .model attribute, not .name
+                    name = getattr(m, "model", None) or getattr(m, "name", None)
+
+                # Ensure we got a non-empty string
+                if name and isinstance(name, str) and name.strip():
+                    model_names.append(name.strip())
+            except Exception:
+                # Skip models that can't be parsed
+                continue
+
+        return model_names
+
+    def _find_matching_model(self, target: str, available: list[str]) -> bool:
+        """Find if target model matches any available model (handles tag variations)."""
+        target_base = target.split(":")[0]  # e.g., "qwen2.5-coder" from "qwen2.5-coder:32b"
+
+        for model_name in available:
+            # Exact match
+            if model_name == target:
+                return True
+            # Match base name (ignoring tags)
+            if model_name.split(":")[0] == target_base:
+                return True
+            # Match if target is contained in model name
+            if target.lower() in model_name.lower():
+                return True
+
+        return False
+
+    def list_available_models(self) -> list[str]:
+        """Return list of all available Ollama models."""
+        client = self._get_client()
+        try:
+            models_response = client.list()
+            return self._extract_model_names(models_response)
+        except Exception as e:
+            print(f"ERROR listing models: {e}")
+            return []
 
     def generate(self, prompt: str, system: str = "") -> dict:
         """
@@ -356,6 +433,119 @@ def synthesize_with_claude(
 
 
 # ---------------------------------------------------------------------------
+# Save Raw Input Chunks (No Processing)
+# ---------------------------------------------------------------------------
+
+def save_raw_chunk_file(
+    book_title: str,
+    author: str,
+    chunk_number: int,
+    total_chunks: int,
+    chunk: dict,
+    output_dir: str,
+) -> str:
+    """
+    Save the raw, unprocessed chunk text from the book.
+    This is the input BEFORE it goes to the LLM.
+    """
+    chunks_dir = os.path.join(output_dir, f"{_slugify(book_title)}_raw_chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+
+    chunk_title = chunk["title"].replace(" (part ", "_p").replace(")", "")
+    filename = f"{chunk_number:02d}_{_slugify(chunk_title)}.txt"
+    filepath = os.path.join(chunks_dir, filename)
+
+    # Create content with metadata header
+    content = f"""{"=" * 70}
+BOOK: {book_title}
+AUTHOR: {author}
+CHAPTER/SECTION: {chunk["title"]}
+CHUNK: {chunk_number} of {total_chunks}
+CHARACTERS: {len(chunk["content"]):,}
+TOKENS (estimated): {len(chunk["content"]) // 4:,}
+{"=" * 70}
+
+{chunk["content"]}
+
+{"=" * 70}
+END OF CHUNK {chunk_number}
+{"=" * 70}
+"""
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return filepath
+
+
+# ---------------------------------------------------------------------------
+# Save Individual Chunk Files (Real-time)
+# ---------------------------------------------------------------------------
+
+def save_chunk_file_realtime(
+    book_title: str,
+    author: str,
+    chunk_number: int,
+    total_chunks: int,
+    chunk: dict,
+    analysis: dict,
+    output_dir: str,
+) -> str:
+    """
+    Save a single chunk file in real-time as it's processed.
+    Shows what goes in (input) and what comes out (analysis).
+    """
+    chunks_dir = os.path.join(output_dir, f"{_slugify(book_title)}_chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+
+    # Create filename: 01_Chapter Title.md, 02_Chapter Two.md, etc.
+    chunk_title = chunk["title"].replace(" (part ", "_p").replace(")", "")
+    filename = f"{chunk_number:02d}_{_slugify(chunk_title)}.md"
+    filepath = os.path.join(chunks_dir, filename)
+
+    # Create markdown content with input and output sections
+    input_preview = chunk["content"][:500] + "..." if len(chunk["content"]) > 500 else chunk["content"]
+
+    content = f"""# {chunk["title"]}
+
+**Book:** {book_title}
+**Author:** {author}
+**Chunk:** {chunk_number} of {total_chunks}
+
+---
+
+## Input (What went in)
+
+**Characters:** {len(chunk["content"]):,}
+**Title:** {chunk["title"]}
+
+**Content Preview:**
+{input_preview}
+
+---
+
+## Output (What came out)
+
+**Input Tokens:** {analysis.get('input_tokens', 0)}
+**Output Tokens:** {analysis.get('output_tokens', 0)}
+**Processing Time:** {analysis.get('duration_ms', 0) / 1000:.1f}s
+
+### Analysis
+
+{analysis['analysis']}
+
+---
+
+**Generated at:** {analysis.get('duration_ms', 0) / 1000:.1f}s
+"""
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return filepath
+
+
+# ---------------------------------------------------------------------------
 # Main Pipeline
 # ---------------------------------------------------------------------------
 
@@ -409,6 +599,16 @@ def run_ollama_pipeline(
     chunks = chunk_text(raw_text, base_config)
     print(f"  Created {len(chunks)} chunks")
 
+    # Save raw chunks if requested (BEFORE LLM processing)
+    if config.save_raw_chunks:
+        print("\n  Saving raw input chunks...")
+        for i, chunk in enumerate(chunks, 1):
+            save_raw_chunk_file(
+                book_title, author, i, len(chunks), chunk, output_dir
+            )
+        raw_chunks_dir = os.path.join(output_dir, f"{_slugify(book_title)}_raw_chunks")
+        print(f"  Raw chunks saved to: {raw_chunks_dir}/")
+
     # Step 3: Per-chunk extraction with Ollama
     print(f"\n[3/4] Extracting insights per chunk (using {config.ollama_model})...")
     chunk_analyses = []
@@ -416,6 +616,8 @@ def run_ollama_pipeline(
 
     for i, chunk in enumerate(chunks):
         print(f"\n  Chunk {i+1}/{len(chunks)}: {chunk['title'][:50]}...")
+        print(f"    Input: {len(chunk['content']):,} chars ({len(chunk['content']) // 4} tokens)")
+
         result = extract_from_chunk_ollama(ollama_client, chunk)
         chunk_analyses.append(result)
 
@@ -424,8 +626,15 @@ def run_ollama_pipeline(
         tokens_per_sec = (
             result["output_tokens"] / duration_s if duration_s > 0 else 0
         )
-        print(f"    {result['input_tokens']} in → {result['output_tokens']} out")
-        print(f"    {duration_s:.1f}s ({tokens_per_sec:.1f} tok/s)")
+        print(f"    Output: {result['input_tokens']} in → {result['output_tokens']} out")
+        print(f"    Speed: {duration_s:.1f}s ({tokens_per_sec:.1f} tok/s)")
+
+        # Save chunk file in real-time if flag is set
+        if config.save_individual_chunks:
+            chunk_file = save_chunk_file_realtime(
+                book_title, author, i + 1, len(chunks), chunk, result, output_dir
+            )
+            print(f"    [SAVED] {os.path.relpath(chunk_file)}")
 
     avg_time = total_duration / len(chunks) if chunks else 0
     print(f"\n  Extraction complete: {total_duration:.0f}s total, {avg_time:.1f}s avg per chunk")
@@ -462,6 +671,12 @@ def run_ollama_pipeline(
         )
         print(f"  NotebookLM source written to: {nlm_path}")
 
+    # Note: Individual chunk files are saved in real-time during extraction
+    chunks_dir = None
+    if config.save_individual_chunks:
+        chunks_dir = os.path.join(output_dir, f"{_slugify(book_title)}_chunks")
+        print(f"  Individual chunk files saved to: {chunks_dir}/")
+
     # Summary
     print(f"\n{'='*60}")
     print(f"  RESULTS")
@@ -478,6 +693,7 @@ def run_ollama_pipeline(
     return {
         "summary_path": output_path,
         "notebooklm_source_path": nlm_path,
+        "chunks_dir": chunks_dir,
         "total_cost": synthesis_cost,
         "chunks_processed": len(chunks),
         "total_duration_s": total_duration,
@@ -518,22 +734,39 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
-              # Fully local, zero cost
-              python ollama_summarizer.py book.pdf --title "Deep Work" --author "Cal Newport"
+              # See your installed models (RECOMMENDED - start here!)
+              python ollama_summarizer.py --list-installed
+
+              # Fully local, zero cost (pick one from --list-installed)
+              python ollama_summarizer.py book.pdf --title "Deep Work" \\
+                --model glm-4.7-flash:latest
+
+              # Save LLM output chunks (analysis)
+              python ollama_summarizer.py book.pdf --title "Deep Work" \\
+                --model glm-4.7-flash:latest --save-chunks
+
+              # Save raw input chunks (before LLM processing)
+              python ollama_summarizer.py book.pdf --title "Deep Work" \\
+                --model glm-4.7-flash:latest --save-raw-chunks
+
+              # Save both raw input AND LLM output chunks
+              python ollama_summarizer.py book.pdf --title "Deep Work" \\
+                --model glm-4.7-flash:latest --save-chunks --save-raw-chunks
 
               # Local extraction + Claude synthesis (best quality, ~$0.05)
-              python ollama_summarizer.py book.pdf --title "Deep Work" --claude-synthesis
+              python ollama_summarizer.py book.pdf --title "Deep Work" \\
+                --claude-synthesis --model glm-4.7-flash:latest
 
               # Use a specific model
-              python ollama_summarizer.py book.pdf --model qwen2.5:14b
+              python ollama_summarizer.py book.pdf --model qwen2.5-coder:32b
 
-              # Show recommended models
+              # Show recommended models (for reference)
               python ollama_summarizer.py --list-models
 
             Prerequisites:
               pip install ollama pypdf ebooklib beautifulsoup4 python-dotenv
               ollama serve              # start Ollama server
-              ollama pull qwen2.5:32b   # download a model
+              ollama pull glm-4.7-flash:latest  # or your model choice
         """),
     )
 
@@ -566,14 +799,43 @@ def main():
         help="Skip generating NotebookLM source file",
     )
     parser.add_argument(
+        "--save-chunks", action="store_true",
+        help="Save each chunk analysis (LLM output) to its own file",
+    )
+    parser.add_argument(
+        "--save-raw-chunks", action="store_true",
+        help="Save raw input chunks (before LLM processing) to individual text files",
+    )
+    parser.add_argument(
         "--list-models", action="store_true",
         help="Show recommended models and exit",
+    )
+    parser.add_argument(
+        "--list-installed", action="store_true",
+        help="Show your locally installed models and exit",
     )
 
     args = parser.parse_args()
 
     if args.list_models:
         print(RECOMMENDED_MODELS)
+        sys.exit(0)
+
+    if args.list_installed:
+        print("\n" + "="*60)
+        print("  INSTALLED OLLAMA MODELS")
+        print("="*60 + "\n")
+        client = OllamaClient(OllamaConfig())
+        installed = client.list_available_models()
+        if installed:
+            for model in sorted(installed):
+                print(f"  [OK] {model}")
+            print(f"\n  Use any of these models with:")
+            print(f"    python ollama_summarizer.py book.pdf --model <model-name>")
+        else:
+            print("  No models found. Install one with:")
+            print("    ollama pull qwen2.5:32b")
+        print("=" * 60 + "\n")
         sys.exit(0)
 
     if not args.filepath:
@@ -587,6 +849,8 @@ def main():
         chunk_size=args.chunk_size,
         num_ctx=args.num_ctx,
         include_notebooklm_source=not args.no_notebooklm,
+        save_individual_chunks=args.save_chunks,
+        save_raw_chunks=args.save_raw_chunks,
     )
 
     run_ollama_pipeline(
